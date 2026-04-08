@@ -1,9 +1,11 @@
+import argparse
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
-import os
 
 
 # ========== 1. GraphSAGE 模型架构 ==========
@@ -42,67 +44,98 @@ class InductiveGraphSAGE(nn.Module):
         return out
 
 
-# ========== 2. 测试与数据组装部分 ==========
-if __name__ == "__main__":
-    # --- 配置参数 ---
-    IMAGE_FEAT_PATH = '04_image_feat_aligned.npy'  # 04 脚本输出的对齐图像特征
-    TEXT_FEAT_PATH = '04_text_feat_aligned.npy'  # 04 脚本输出的对齐文本特征
-    EDGES_PATH = '05_joint_knn_edges.npz'  # 05 脚本输出的 KNN 边文件
+def load_edge_index_npz(path: str, num_items: int) -> np.ndarray:
+    """
+    读取 05 脚本产出的 edges（npz），并尽量兼容不同保存格式，最终返回 (2, E) 的 edge_index。
+    """
+    edges_data = np.load(path)
+    edge_index_np = edges_data[edges_data.files[0]]
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # 情况 A: (num_edges, 2) -> (2, num_edges)
+    if edge_index_np.ndim == 2 and edge_index_np.shape[1] == 2:
+        edge_index_np = edge_index_np.T
+    # 情况 B: (2*num_edges,) -> (2, num_edges)
+    elif edge_index_np.ndim == 1:
+        edge_index_np = edge_index_np.reshape(2, -1)
+    # 情况 C: (N, K) 邻居矩阵 -> COO
+    elif edge_index_np.ndim == 2 and edge_index_np.shape[0] == num_items:
+        n_nodes, k_neighbors = edge_index_np.shape
+        src = np.repeat(np.arange(n_nodes), k_neighbors)
+        dst = edge_index_np.reshape(-1)
+        edge_index_np = np.vstack([src, dst])
+
+    if edge_index_np.ndim != 2 or edge_index_np.shape[0] != 2:
+        raise ValueError(f"edge_index 形状不合法，期望 (2, E)，实际 {edge_index_np.shape}")
+
+    return edge_index_np.astype(np.int64)
+
+
+def build_node_features(image_feat_path: str, text_feat_path: str) -> np.ndarray:
+    img_feat = np.load(image_feat_path).astype(np.float32)
+    txt_feat = np.load(text_feat_path).astype(np.float32)
+    if img_feat.shape[0] != txt_feat.shape[0]:
+        raise ValueError(f"图像/文本特征行数不一致：{img_feat.shape[0]} vs {txt_feat.shape[0]}")
+    return np.concatenate([img_feat, txt_feat], axis=1).astype(np.float32)
+
+
+@torch.no_grad()
+def export_item_embeddings(
+    image_feat_path: str,
+    text_feat_path: str,
+    edges_path: str,
+    hidden_dim: int,
+    output_dim: int,
+    out_path: str,
+    device: torch.device,
+):
+    x_np = build_node_features(image_feat_path, text_feat_path)
+    x = torch.tensor(x_np, device=device)
+    edge_index_np = load_edge_index_npz(edges_path, num_items=x_np.shape[0])
+    edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
+
+    model = InductiveGraphSAGE(feature_dim=x.shape[1], hidden_dim=hidden_dim, output_dim=output_dim).to(device)
+    model.eval()
+    item_emb = model(x, edge_index).cpu().numpy().astype(np.float32)
+    np.save(out_path, item_emb)
+    print(f"✅ 已导出 item embeddings: {out_path}，shape={item_emb.shape}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GraphSAGE 模型定义 +（可选）导出物品向量")
+    parser.add_argument("--image_feat", default="04_image_feat_aligned.npy")
+    parser.add_argument("--text_feat", default="04_text_feat_aligned.npy")
+    parser.add_argument("--edges", default="05_joint_knn_edges.npz")
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--output_dim", type=int, default=128)
+    parser.add_argument("--export", default="", help="如果提供路径，则会导出 item embeddings（.npy）")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    if os.path.exists(IMAGE_FEAT_PATH) and os.path.exists(TEXT_FEAT_PATH) and os.path.exists(EDGES_PATH):
-        print("正在加载对齐特征和图结构...")
-
-        # 1. 加载节点特征并拼接
-        img_feat = np.load(IMAGE_FEAT_PATH).astype(np.float32)
-        txt_feat = np.load(TEXT_FEAT_PATH).astype(np.float32)
-
-        # (N, 256) 和 (N, 256) 拼接 -> (N, 512)
-        x_np = np.concatenate([img_feat, txt_feat], axis=1)
-        x = torch.tensor(x_np).to(device)
-        print(f"节点特征矩阵大小: {x.shape}")
-
-        # 2. 加载边结构 (带有鲁棒的维度修复逻辑)
-        edges_data = np.load(EDGES_PATH)
-        # 获取 npz 文件中的第一个数组
-        edge_index_np = edges_data[edges_data.files[0]]
-        print(f"原始加载的 Numpy 边矩阵大小: {edge_index_np.shape}")
-
-        # 【核心修复逻辑】：确保 edge_index 最终是 (2, num_edges) 的二维矩阵
-        if len(edge_index_np.shape) == 2 and edge_index_np.shape[1] == 2:
-            # 情况A: 形状是 (num_edges, 2)，需要转置
-            edge_index_np = edge_index_np.T
-        elif len(edge_index_np.shape) == 1:
-            # 情况B: 形状是一维数组，需要 reshape 回去
-            edge_index_np = edge_index_np.reshape(2, -1)
-        elif len(edge_index_np.shape) == 2 and edge_index_np.shape[0] == x_np.shape[0]:
-            # 情况C: 05 脚本保存的是 (N, K) 的邻居矩阵，将其转换为边列表 (Edge List)
-            print("检测到输入为邻居矩阵，正在转换为 PyG Edge Index...")
-            N, K = edge_index_np.shape
-            src = np.repeat(np.arange(N), K)  # 源节点
-            dst = edge_index_np.flatten()  # 目标节点
-            edge_index_np = np.vstack([src, dst])  # 组合成 (2, N*K)
-
-        print(f"修正后的 PyG 边矩阵大小: {edge_index_np.shape}")
-
-        # 转换为 PyTorch 的 LongTensor
-        edge_index = torch.tensor(edge_index_np, dtype=torch.long).to(device)
-
-        # 3. 实例化模型
-        N, feature_dim = x.shape
-        hidden_dim = 256
-        output_dim = 128  # 最终送到推荐损失函数的维度
-
-        model = InductiveGraphSAGE(feature_dim, hidden_dim, output_dim).to(device)
-
-        # 4. 执行前向传播 (测试提取特征)
-        model.eval()  # 测试阶段设为 eval 模式 (关闭 dropout)
-        with torch.no_grad():
-            item_embeddings = model(x, edge_index)
-
-        print(f"✅ 测试成功！GraphSAGE 成功输出了所有 Item 的高阶隐向量，形状为: {item_embeddings.shape}")
-
+    if args.export:
+        for p in [args.image_feat, args.text_feat, args.edges]:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"未找到文件：{p}")
+        export_item_embeddings(
+            image_feat_path=args.image_feat,
+            text_feat_path=args.text_feat,
+            edges_path=args.edges,
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim,
+            out_path=args.export,
+            device=device,
+        )
     else:
-        print("❌ 错误: 未找到 04 或 05 脚本的输出文件。请确认文件路径或先运行前置步骤。")
+        # 不导出时，仅做一次轻量 sanity check
+        ok = all(os.path.exists(p) for p in [args.image_feat, args.text_feat, args.edges])
+        if not ok:
+            print("未检测到对齐特征或图边文件。仅导入模型类无需这些文件。")
+            return
+        x_np = build_node_features(args.image_feat, args.text_feat)
+        edge_index_np = load_edge_index_npz(args.edges, num_items=x_np.shape[0])
+        print(f"✅ 节点特征: {x_np.shape}，edge_index: {edge_index_np.shape}")
+
+
+if __name__ == "__main__":
+    main()
