@@ -10,18 +10,20 @@ from torch_geometric.nn import SAGEConv
 
 # ========== 1. GraphSAGE 模型架构 ==========
 class InductiveGraphSAGE(nn.Module):
-    def __init__(self, feature_dim, hidden_dim, output_dim):
+    def __init__(self, feature_dim, hidden_dim, output_dim, dropout: float = 0.2):
         """
         纯归纳式 GraphSAGE 模型 (不含任何 ID Embedding)
         :param feature_dim: 输入的多模态特征维度 (如 256 + 256 = 512)
         :param hidden_dim: 隐藏层维度
         :param output_dim: 最终输出的节点表征维度
+        :param dropout: 第一层 ReLU 后的 dropout 概率（过大时早期难收敛，默认 0.2）
         """
         super(InductiveGraphSAGE, self).__init__()
 
         # SAGEConv 聚合的是节点的纯特征，不记忆 ID，非常适合冷启动/Zero-Shot
         self.conv1 = SAGEConv(feature_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, output_dim)
+        self.dropout = float(dropout)
 
     def forward(self, x, edge_index):
         """
@@ -33,7 +35,7 @@ class InductiveGraphSAGE(nn.Module):
         # 第一层：聚合邻居特征 -> 激活 -> Dropout 防过拟合
         h = self.conv1(x, edge_index)
         h = F.relu(h)
-        h = F.dropout(h, p=0.5, training=self.training)
+        h = F.dropout(h, p=self.dropout, training=self.training)
 
         # 第二层：输出最终特征
         h = self.conv2(h, edge_index)
@@ -87,13 +89,16 @@ def export_item_embeddings(
     output_dim: int,
     out_path: str,
     device: torch.device,
+    dropout: float = 0.2,
 ):
     x_np = build_node_features(image_feat_path, text_feat_path)
     x = torch.tensor(x_np, device=device)
     edge_index_np = load_edge_index_npz(edges_path, num_items=x_np.shape[0])
     edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
 
-    model = InductiveGraphSAGE(feature_dim=x.shape[1], hidden_dim=hidden_dim, output_dim=output_dim).to(device)
+    model = InductiveGraphSAGE(
+        feature_dim=x.shape[1], hidden_dim=hidden_dim, output_dim=output_dim, dropout=dropout
+    ).to(device)
     model.eval()
     item_emb = model(x, edge_index).cpu().numpy().astype(np.float32)
     np.save(out_path, item_emb)
@@ -107,6 +112,7 @@ def main():
     parser.add_argument("--edges", default="05_joint_knn_edges.npz")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--output_dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--export", default="", help="如果提供路径，则会导出 item embeddings（.npy）")
     args = parser.parse_args()
 
@@ -125,6 +131,7 @@ def main():
             output_dim=args.output_dim,
             out_path=args.export,
             device=device,
+            dropout=args.dropout,
         )
     else:
         # 不导出时，仅做一次轻量 sanity check
