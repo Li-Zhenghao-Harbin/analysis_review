@@ -1,1 +1,0 @@
-print("debug: auto2222")

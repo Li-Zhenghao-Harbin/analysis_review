@@ -1,498 +1,270 @@
-import argparse
-import datetime
-import logging
 import os
-from dataclasses import dataclass
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader
 from tqdm import tqdm
 import importlib
 
-gnn_module = importlib.import_module("06_gnn_model")
-InductiveGraphSAGE = gnn_module.InductiveGraphSAGE
-load_edge_index_npz = gnn_module.load_edge_index_npz
-build_node_features = gnn_module.build_node_features
+# ========== 动态导入 06_gnn_model ==========
+try:
+    gnn_module = importlib.import_module("06_gnn_model")
+    InductiveGraphSAGE = gnn_module.InductiveGraphSAGE
+    print("成功导入 06_gnn_model.py 中的 GraphSAGE 模型")
+except ModuleNotFoundError:
+    raise Exception("❌ 找不到 06_gnn_model.py 文件，请确保它与此脚本在同一目录下！")
 
-
-# ========== 1. 数据集与负采样策略 (Negative Sampling) ==========
-class BPRDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, num_items: int, seed: int = 42):
+# ========== 1. 数据集：返回用户、正样本、多个负样本 ==========
+class BPRMultiNegDataset(Dataset):
+    def __init__(self, interaction_file, num_items, num_neg=5):
         """
-        df 需要包含列：user, item, rating（timestamp 可有可无）
+        :param interaction_file: 交互文件路径 (user, item, rating, timestamp)
+        :param num_items: 物品总数
+        :param num_neg: 每个正样本对应的负样本数量
         """
-        super(BPRDataset, self).__init__()
-        self.data = df.reset_index(drop=True)
-        self.users = self.data["user"].to_numpy(dtype=np.int64)
-        self.pos_items = self.data["item"].to_numpy(dtype=np.int64)
-        self.ratings = self.data["rating"].to_numpy(dtype=np.float32)
+        print(f"正在加载交互数据: {interaction_file}")
+        self.data = pd.read_csv(interaction_file, names=['user', 'item', 'rating', 'timestamp'])
+        self.users = self.data['user'].values
+        self.pos_items = self.data['item'].values
+        self.ratings = self.data['rating'].values
         self.num_items = num_items
-        self.rng = np.random.default_rng(seed)
+        self.num_neg = num_neg
 
-        # 构建 User 历史交互字典，用于过滤负样本（确保采样的负样本用户绝对没见过）
-        print("构建用户历史交互字典以辅助负采样...")
-        self.user_history = self.data.groupby("user")["item"].apply(set).to_dict()
+        # 构建用户历史交互字典，用于负采样过滤
+        print("构建用户历史交互字典...")
+        self.user_history = self.data.groupby('user')['item'].apply(set).to_dict()
 
     def __len__(self):
         return len(self.users)
 
     def __getitem__(self, idx):
-        user = int(self.users[idx])
-        pos_item = int(self.pos_items[idx])
-        rating = float(self.ratings[idx])
+        user = self.users[idx]
+        pos_item = self.pos_items[idx]
+        rating = self.ratings[idx]
 
-        # 动态随机负采样 (Dynamic Negative Sampling)
-        neg_item = int(self.rng.integers(0, self.num_items))
-        while neg_item in self.user_history[user]:
-            neg_item = int(self.rng.integers(0, self.num_items))
-
-        return (
-            torch.tensor(user, dtype=torch.long),
-            torch.tensor(pos_item, dtype=torch.long),
-            torch.tensor(neg_item, dtype=torch.long),
-            torch.tensor(rating, dtype=torch.float32),
-        )
+        # 采样 num_neg 个负样本（排除用户历史）
+        neg_items = []
+        for _ in range(self.num_neg):
+            neg = np.random.randint(0, self.num_items)
+            while neg in self.user_history[user]:
+                neg = np.random.randint(0, self.num_items)
+            neg_items.append(neg)
+        return user, pos_item, neg_items, rating
 
 
-# ========== 2. 多模态推荐打分模块 ==========
+# ========== 2. 多模态推荐模块（使用多个负样本）==========
 class MultimodalRecommender(nn.Module):
     def __init__(self, num_users, item_output_dim):
-        super(MultimodalRecommender, self).__init__()
-        # 为用户分配可学习的 Embedding
+        super().__init__()
         self.user_embedding = nn.Embedding(num_users, item_output_dim)
-        # 初始化权重
         nn.init.xavier_uniform_(self.user_embedding.weight)
 
-    def forward(self, users, pos_items, neg_items, all_item_embs):
+    def forward(self, users, pos_items, neg_items_list, all_item_embs):
         """
-        :param users: batch_size 个用户的 ID
-        :param pos_items: batch_size 个正样本物品 ID
-        :param neg_items: batch_size 个负样本物品 ID
-        :param all_item_embs: GraphSAGE 刚刚输出的全体物品的最新表征 (N, item_output_dim)
+        :param users: (batch_size,)
+        :param pos_items: (batch_size,)
+        :param neg_items_list: (batch_size, num_neg)
+        :param all_item_embs: (N, item_output_dim)
         """
-        u_emb = self.user_embedding(users)  # (batch_size, dim)
-        pos_i_emb = all_item_embs[pos_items]  # (batch_size, dim)
-        neg_i_emb = all_item_embs[neg_items]  # (batch_size, dim)
+        u_emb = self.user_embedding(users)                     # (B, D)
+        pos_emb = all_item_embs[pos_items]                     # (B, D)
+        # 负样本嵌入: (B, num_neg, D)
+        neg_emb = all_item_embs[neg_items_list]                # (B, num_neg, D)
 
-        # 计算内积偏好得分
-        pos_scores = (u_emb * pos_i_emb).sum(dim=1)  # (batch_size,)
-        neg_scores = (u_emb * neg_i_emb).sum(dim=1)  # (batch_size,)
+        pos_scores = (u_emb * pos_emb).sum(dim=1)              # (B,)
+        # 负样本得分: (B, num_neg)
+        neg_scores = (u_emb.unsqueeze(1) * neg_emb).sum(dim=2) # (B, num_neg)
 
         return pos_scores, neg_scores
 
 
-# ========== 3. 加权 BPR 损失函数 ==========
-def weighted_bpr_loss(pos_scores, neg_scores, ratings):
+# ========== 3. 损失函数（BPR + 多负样本）==========
+def bpr_loss_with_multi_neg(pos_scores, neg_scores):
     """
-    基于 1-5 星评价的加权 BPR 损失
+    pos_scores: (batch_size,)
+    neg_scores: (batch_size, num_neg)
+    返回标量损失
     """
-    # 基础 BPR：倾向于最大化正样本和负样本的得分差 (pos - neg)
-    base_loss = -torch.nn.functional.logsigmoid(pos_scores - neg_scores)
-
-    # 评分加权策略 (Rating-weighted): 5星权重1.0，1星权重0.2
-    weights = ratings.float() / 5.0
-    loss = (base_loss * weights).mean()
+    # 对于每个正样本，计算其与每个负样本的 log-sigmoid 差值，然后取平均
+    # loss = -1/num_neg * sum_{neg} log(sigmoid(pos - neg))
+    # 广播: pos_scores (B,1) - neg_scores (B, num_neg)
+    diff = pos_scores.unsqueeze(1) - neg_scores   # (B, num_neg)
+    loss = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
     return loss
 
 
-def _read_interactions_csv(path: str) -> pd.DataFrame:
-    """
-    尽量兼容两种格式：
-    1) 有表头：user_id,item_id,rating,timestamp
-    2) 无表头：四列依次为 user,item,rating,timestamp
-    返回列名统一为：user, item, rating, timestamp(可选)
-    """
-    df0 = pd.read_csv(path)
-    cols = set(df0.columns.astype(str).tolist())
+# ========== 4. 主训练函数 ==========
+def train():
+    # --- 配置参数 ---
+    INTERACTION_FILE = '01_elec_5core_interactions.csv'
+    IMAGE_FEAT_PATH = 'image_feat_aligned.npy'
+    TEXT_FEAT_PATH = 'text_feat_aligned.npy'
+    EDGES_PATH = 'joint_knn_edges.npz'
 
-    # 有表头
-    if {"user_id", "item_id"}.issubset(cols):
-        df = df0.rename(columns={"user_id": "user", "item_id": "item"}).copy()
-        if "rating" not in df.columns:
-            raise ValueError("交互文件缺少 rating 列")
-        if "timestamp" not in df.columns:
-            df["timestamp"] = 0
-        return df[["user", "item", "rating", "timestamp"]]
+    BATCH_SIZE = 1024          # 子图采样的 batch 大小（种子节点数）
+    NUM_NEG = 5                # 每个正样本的负样本数量
+    EPOCHS = 30
+    LR = 1e-3
+    WEIGHT_DECAY = 1e-5
+    HIDDEN_DIM = 256
+    OUTPUT_DIM = 128
+    NUM_LAYERS = 2             # 与 GraphSAGE 层数一致
+    NUM_NEIGHBORS = [20, 10]   # 每层采样的邻居数，需与层数长度一致
 
-    # 另一种常见表头
-    if {"user", "item"}.issubset(cols):
-        df = df0.copy()
-        if "rating" not in df.columns:
-            raise ValueError("交互文件缺少 rating 列")
-        if "timestamp" not in df.columns:
-            df["timestamp"] = 0
-        return df[["user", "item", "rating", "timestamp"]]
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"训练设备: {device}")
 
-    # 无表头兜底
-    df = pd.read_csv(path, header=None, names=["user", "item", "rating", "timestamp"])
-    return df
-
-
-def _remap_users_to_contiguous(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    将 user 映射为 0..num_users-1，返回：
-    - 重映射后的 interactions df（user 已变成 new_user_id）
-    - user_map 表：old_user_id, new_user_id
-    """
-    old_users = df["user"].astype(str)
-    uniq = pd.Index(old_users.unique())
-    new_ids = np.arange(len(uniq), dtype=np.int64)
-    mapper = pd.Series(new_ids, index=uniq)
-
-    df2 = df.copy()
-    df2["user"] = old_users.map(mapper).astype(np.int64)
-
-    user_map = pd.DataFrame({"old_user_id": uniq.astype(str), "new_user_id": new_ids})
-    return df2, user_map
-
-
-@dataclass
-class TrainConfig:
-    interactions: str = "01_elec_5core_interactions.csv"
-    image_feat: str = "04_image_feat_aligned.npy"
-    text_feat: str = "04_text_feat_aligned.npy"
-    edges: str = "05_joint_knn_edges.npz"
-    out_ckpt: str = "multimodal_recommender_final.pth"
-    out_user_map: str = "user_id_map.csv"
-    batch_size: int = 2048
-    epochs: int = 30
-    lr: float = 1e-3
-    # 解冻 GNN 后，GNN 使用较小学习率（若未指定 lr_gnn，则为 lr * lr_gnn_ratio）
-    lr_gnn: Optional[float] = None
-    lr_gnn_ratio: float = 0.1
-    hidden_dim: int = 256
-    output_dim: int = 128
-    dropout: float = 0.2
-    weight_decay: float = 1e-4
-    # 前若干 epoch 只训练 user embedding，GNN 前向用 no_grad + eval（关闭 dropout）
-    freeze_gnn_epochs: int = 5
-    seed: int = 42
-    log_every: int = 50
-    log_file: str = "train.log"
-    eval_users: int = 5000
-    eval_neg: int = 100
-    eval_k: int = 10
-
-
-def _setup_logger(log_file: str) -> logging.Logger:
-    logger = logging.getLogger("train_logger")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    return logger
-
-
-@torch.no_grad()
-def _eval_ranking_metrics(
-    gnn_model: nn.Module,
-    rec_model: MultimodalRecommender,
-    node_features: torch.Tensor,
-    edge_index: torch.Tensor,
-    user_pos_items: dict[int, list[int]],
-    user_history: dict[int, set[int]],
-    num_items: int,
-    device: torch.device,
-    n_users: int = 5000,
-    n_neg: int = 100,
-    k: int = 10,
-    seed: int = 42,
-) -> dict[str, float]:
-    """
-    轻量评估：对随机抽样的用户，每人抽 1 个正样本 + n_neg 个负样本，计算：
-    - AUC（正样本分数 > 负样本分数的比例）
-    - HitRate@K（TopK 是否命中正样本）
-    - Precision@K（单正样本设定下，等于 Hit/K）
-    - MRR（正样本在候选排序中的倒数排名）
-    """
-    gnn_model.eval()
-    rec_model.eval()
-
-    rng = np.random.default_rng(seed)
-    users_all = np.fromiter(user_pos_items.keys(), dtype=np.int64)
-    if users_all.size == 0:
-        return {"auc": float("nan"), "hitrate@k": float("nan"), "precision@k": float("nan"), "mrr": float("nan")}
-
-    n_users = int(min(n_users, users_all.size))
-    sampled_users = rng.choice(users_all, size=n_users, replace=False)
-    k = int(max(1, min(k, n_neg + 1)))
-
-    # 全量 item embedding（评估阶段不需要梯度）
-    all_item_embs = gnn_model(node_features, edge_index)  # (N, dim)
-    user_emb_table = rec_model.user_embedding.weight  # (U, dim)
-
-    hits = 0
-    auc_sum = 0.0
-    mrr_sum = 0.0
-
-    for u in sampled_users.tolist():
-        pos_list = user_pos_items.get(u, [])
-        if not pos_list:
-            continue
-        pos_item = int(rng.choice(pos_list))
-
-        seen = user_history.get(u, set())
-        neg_items = []
-        # 负采样：保证没见过且不等于 pos
-        while len(neg_items) < n_neg:
-            ni = int(rng.integers(0, num_items))
-            if ni == pos_item or ni in seen:
-                continue
-            neg_items.append(ni)
-
-        cand_items = np.array([pos_item] + neg_items, dtype=np.int64)
-        cand_items_t = torch.from_numpy(cand_items).to(device)
-
-        u_emb = user_emb_table[u]  # (dim,)
-        cand_emb = all_item_embs[cand_items_t]  # (1+n_neg, dim)
-        scores = (cand_emb * u_emb).sum(dim=1)  # (1+n_neg,)
-
-        pos_score = float(scores[0].item())
-        neg_scores = scores[1:]
-        auc_sum += float((neg_scores < pos_score).float().mean().item())
-
-        # 排序：pos 在 candidates 中的名次
-        order = torch.argsort(scores, descending=True)
-        rank = int((order == 0).nonzero(as_tuple=False).item()) + 1  # 1-based
-        mrr_sum += 1.0 / rank
-        if rank <= k:
-            hits += 1
-
-    denom = float(n_users)
-    hitrate = hits / denom
-    precision = hitrate / float(k)
-    auc = auc_sum / denom
-    mrr = mrr_sum / denom
-    return {"auc": auc, "hitrate@k": hitrate, "precision@k": precision, "mrr": mrr}
-
-
-def train(cfg: TrainConfig):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger = _setup_logger(cfg.log_file)
-    logger.info(f"训练设备: {device}")
-    logger.info(f"启动时间: {datetime.datetime.now().isoformat(timespec='seconds')}")
-    logger.info(f"训练配置: {cfg.__dict__}")
-
-    for p in [cfg.interactions, cfg.image_feat, cfg.text_feat, cfg.edges]:
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"未找到文件：{p}")
-
-    # 1) 节点特征 & 图
-    x_np = build_node_features(cfg.image_feat, cfg.text_feat)  # (N, 512)
-    num_items = x_np.shape[0]
+    # --- 1. 加载节点多模态特征并拼接 ---
+    print("加载对齐特征...")
+    img_feat = np.load(IMAGE_FEAT_PATH).astype(np.float32)
+    txt_feat = np.load(TEXT_FEAT_PATH).astype(np.float32)
+    x_np = np.concatenate([img_feat, txt_feat], axis=1)   # (N, 512)
     node_features = torch.tensor(x_np, device=device)
-    edge_index_np = load_edge_index_npz(cfg.edges, num_items=num_items)
+    num_items = node_features.shape[0]
+    print(f"物品数量: {num_items}, 特征维度: {node_features.shape[1]}")
+
+    # --- 2. 加载图拓扑结构（KNN 边）并转换为 PyG 格式 ---
+    print("加载图边结构...")
+    edges_data = np.load(EDGES_PATH)
+    edge_index_np = edges_data[edges_data.files[0]]
+
+    # 鲁棒修复逻辑：确保 edge_index_np 形状为 (2, num_edges)
+    if len(edge_index_np.shape) == 2 and edge_index_np.shape[1] == 2:
+        edge_index_np = edge_index_np.T
+    elif len(edge_index_np.shape) == 1:
+        edge_index_np = edge_index_np.reshape(2, -1)
+    elif len(edge_index_np.shape) == 2 and edge_index_np.shape[0] == num_items:
+        # 假设是 (N, K) 邻居矩阵，转换为边列表
+        N, K = edge_index_np.shape
+        src = np.repeat(np.arange(N), K)
+        dst = edge_index_np.flatten()
+        edge_index_np = np.vstack([src, dst])
+    else:
+        raise ValueError(f"无法识别的边矩阵形状: {edge_index_np.shape}")
+
     edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
-    logger.info(f"节点特征: {x_np.shape}，edge_index: {edge_index_np.shape}")
+    print(f"图边数量: {edge_index.shape[1]}")
 
-    # 2) 交互数据（读入 + user 重映射）
-    df = _read_interactions_csv(cfg.interactions)
-    # 物品 id 必须是 0..num_items-1
-    df["item"] = df["item"].astype(np.int64)
-    if df["item"].min() < 0 or df["item"].max() >= num_items:
-        raise ValueError(
-            f"交互数据里的 item_id 范围不合法：min={df['item'].min()} max={df['item'].max()}，"
-            f"但 num_items={num_items}。请确认 item_id 是否与特征的行号对齐。"
-        )
-    df["rating"] = df["rating"].astype(np.float32)
+    # 创建 PyG Data 对象
+    data = Data(x=node_features, edge_index=edge_index)
 
-    df, user_map = _remap_users_to_contiguous(df)
-    user_map.to_csv(cfg.out_user_map, index=False, encoding="utf-8-sig")
-    num_users = int(user_map.shape[0])
-    logger.info(f"用户重映射完成：num_users={num_users}，映射表已保存：{cfg.out_user_map}")
+    # --- 3. 准备 BPR 数据集和普通 DataLoader（用于获取用户、物品ID）---
+    if not os.path.exists(INTERACTION_FILE):
+        raise FileNotFoundError(f"❌ 找不到交互文件 {INTERACTION_FILE}")
+    dataset = BPRMultiNegDataset(INTERACTION_FILE, num_items, num_neg=NUM_NEG)
+    num_users = len(dataset.user_history)
+    print(f"用户数: {num_users}, 交互数: {len(dataset)}")
 
-    # 给评估用：每个用户的正样本 item 列表（训练集内抽 1 个正样本做候选评估）
-    user_pos_items = df.groupby("user")["item"].apply(list).to_dict()
+    # 注意：这里使用普通的 DataLoader 获取 (user, pos, neg_items, rating)
+    # 但不直接用于模型前向，而是提供种子节点 ID
+    bpr_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-    dataset = BPRDataset(df=df, num_items=num_items, seed=cfg.seed)
-    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
-    logger.info(f"统计 -> 总用户: {num_users}, 总物品: {num_items}, 交互数: {len(dataset)}")
+    # --- 4. 初始化模型 ---
+    feature_dim = node_features.shape[1]
+    gnn_model = InductiveGraphSAGE(feature_dim, HIDDEN_DIM, OUTPUT_DIM).to(device)
+    rec_model = MultimodalRecommender(num_users, OUTPUT_DIM).to(device)
 
-    # 3) 模型
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    gnn_model = InductiveGraphSAGE(
-        node_features.shape[1], cfg.hidden_dim, cfg.output_dim, dropout=cfg.dropout
-    ).to(device)
-    rec_model = MultimodalRecommender(num_users, cfg.output_dim).to(device)
-
-    lr_gnn_eff = cfg.lr_gnn if cfg.lr_gnn is not None else (cfg.lr * cfg.lr_gnn_ratio)
-    opt_user_only = optim.Adam(rec_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    opt_joint = optim.Adam(
-        [
-            {"params": gnn_model.parameters(), "lr": lr_gnn_eff, "weight_decay": cfg.weight_decay},
-            {"params": rec_model.parameters(), "lr": cfg.lr, "weight_decay": cfg.weight_decay},
-        ]
+    optimizer = optim.Adam(
+        list(gnn_model.parameters()) + list(rec_model.parameters()),
+        lr=LR, weight_decay=WEIGHT_DECAY
     )
-    logger.info(
-        "优化策略: freeze_gnn_epochs=%d | 解冻后 lr_gnn=%.6f | lr_user=%.6f | dropout=%.3f",
-        cfg.freeze_gnn_epochs,
-        lr_gnn_eff,
-        cfg.lr,
-        cfg.dropout,
-    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
 
-    # 4) 训练
-    for epoch in range(cfg.epochs):
-        frozen = epoch < cfg.freeze_gnn_epochs
-        if frozen:
-            gnn_model.eval()
-            rec_model.train()
-            optimizer = opt_user_only
-        else:
-            if cfg.freeze_gnn_epochs > 0 and epoch == cfg.freeze_gnn_epochs:
-                logger.info(">>> 解冻 GNN：开始联合训练 user embedding + GraphSAGE")
-            gnn_model.train()
-            rec_model.train()
-            optimizer = opt_joint
-
+    # --- 5. 训练循环（使用 NeighborLoader 子图采样）---
+    for epoch in range(1, EPOCHS + 1):
+        gnn_model.train()
+        rec_model.train()
         total_loss = 0.0
-        phase = "freeze_user" if frozen else "joint"
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{cfg.epochs} [{phase}]")
-        for step, (users, pos_items, neg_items, ratings) in enumerate(pbar, start=1):
+        num_batches = 0
+
+        # 每个 epoch 重新创建 NeighborLoader，保证采样随机性
+        # 种子节点是当前 batch 中出现的所有物品 ID（包括正负样本）
+        # 我们需要提前从 bpr_loader 中获取当前 batch 的物品 ID 集合，然后作为种子传给 NeighborLoader
+        # 但 NeighborLoader 期望的 input_nodes 是一个节点索引张量，且需要与 batch 顺序对应。
+        # 实现方法：在迭代 bpr_loader 的同时，对每个 batch 单独构建一个子图采样器。
+        # 这样每个 batch 独立采样，开销稍大但可行。
+
+        pbar = tqdm(bpr_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+        for batch_idx, (users, pos_items, neg_items_list, ratings) in enumerate(pbar):
             users = users.to(device)
             pos_items = pos_items.to(device)
-            neg_items = neg_items.to(device)
+            # neg_items_list 是 list of lists，转换为 tensor (batch_size, num_neg)
+            neg_items = torch.tensor(neg_items_list, dtype=torch.long, device=device)  # (B, num_neg)
             ratings = ratings.to(device)
 
+            # 收集当前 batch 中涉及的所有物品 ID（正样本 + 所有负样本）
+            # 注意：负样本是 (B, num_neg)，需要展平
+            all_item_ids = torch.cat([pos_items, neg_items.view(-1)]).unique()
+            # 使用 NeighborLoader 采样这些种子节点的子图
+            # 注意：NeighborLoader 要求 input_nodes 是 1D tensor，且必须在图节点范围内
+            loader = NeighborLoader(
+                data,
+                num_neighbors=NUM_NEIGHBORS,
+                batch_size=len(all_item_ids),
+                input_nodes=all_item_ids,
+                shuffle=False,   # 不需要打乱，因为种子节点顺序不重要
+                num_workers=0,
+            )
+            # 由于 input_nodes 可能很多，但 NeighborLoader 会返回一个 batch 对象
+            # 注意：NeighborLoader 可能将 input_nodes 拆分成多个子 batch（如果超过 batch_size），但我们设置的 batch_size 等于种子节点数，所以通常只有一个子图
+            # 为了简单，我们直接取第一个（也是唯一一个）子图
+            for subgraph in loader:
+                sub_x = subgraph.x
+                sub_edge_index = subgraph.edge_index
+                # 子图中节点的顺序：前 len(all_item_ids) 个节点就是种子节点，顺序与 all_item_ids 一致
+                seed_emb = gnn_model(sub_x, sub_edge_index)[:len(all_item_ids)]
+                # 建立映射：从 all_item_ids 到其嵌入的索引
+                id_to_emb = {int(all_item_ids[i]): seed_emb[i] for i in range(len(all_item_ids))}
+                # 提取 pos_items 和 neg_items 对应的嵌入
+                pos_emb = torch.stack([id_to_emb[int(pid)] for pid in pos_items])   # (B, out_dim)
+                neg_emb = torch.stack([torch.stack([id_to_emb[int(nid)] for nid in row]) for row in neg_items])  # (B, num_neg, out_dim)
+                # 注意：neg_items 是 (B, num_neg)
+                # 重构 all_item_embs 为 (B, out_dim) 和 (B, num_neg, out_dim) 后，可以送入推荐模型
+                # 但推荐模型需要全量的 all_item_embs？不，我们只需要当前 batch 的正负物品嵌入。
+                # 因此我们直接计算 BPR 损失，不经过 rec_model 的 user embedding 部分（user embedding 仍然需要）
+                # 我们需要获取用户嵌入
+                u_emb = rec_model.user_embedding(users)   # (B, out_dim)
+                pos_scores = (u_emb * pos_emb).sum(dim=1)
+                # neg_scores: (B, num_neg)
+                neg_scores = (u_emb.unsqueeze(1) * neg_emb).sum(dim=2)
+                loss = bpr_loss_with_multi_neg(pos_scores, neg_scores)
+                break   # 只有一个子图，跳出循环
+
+            # 反向传播
             optimizer.zero_grad()
-
-            if frozen:
-                # 只更新 user embedding：GNN 前向不建计算图、不更新参数
-                with torch.no_grad():
-                    all_item_embs = gnn_model(node_features, edge_index)
-            else:
-                all_item_embs = gnn_model(node_features, edge_index)
-
-            pos_scores, neg_scores = rec_model(users, pos_items, neg_items, all_item_embs)
-            loss = weighted_bpr_loss(pos_scores, neg_scores, ratings)
             loss.backward()
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(rec_model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            total_loss += float(loss.item())
-            if step % cfg.log_every == 0:
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            total_loss += loss.item()
+            num_batches += 1
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-        avg_loss = total_loss / max(1, len(dataloader))
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch} 平均损失: {avg_loss:.4f}")
+        scheduler.step(avg_loss)
 
-        # 每个 epoch 结束做一次轻量评估（不需要额外 val/test 文件）
-        metrics = _eval_ranking_metrics(
-            gnn_model=gnn_model,
-            rec_model=rec_model,
-            node_features=node_features,
-            edge_index=edge_index,
-            user_pos_items=user_pos_items,
-            user_history=dataset.user_history,
-            num_items=num_items,
-            device=device,
-            n_users=cfg.eval_users,
-            n_neg=cfg.eval_neg,
-            k=cfg.eval_k,
-            seed=cfg.seed + epoch,
-        )
+    # --- 6. 保存最终模型 ---
+    torch.save({
+        'gnn_state_dict': gnn_model.state_dict(),
+        'rec_state_dict': rec_model.state_dict(),
+    }, 'multimodal_recommender_optimized_mhm.pth')
+    print("✅ 训练完成，模型已保存为 multimodal_recommender_optimized_mhm.pth")
 
-        logger.info(
-            "Epoch %d/%d | phase=%s | loss=%.6f | AUC=%.4f | HitRate@%d=%.4f | Precision@%d=%.6f | MRR=%.4f",
-            epoch + 1,
-            cfg.epochs,
-            phase,
-            avg_loss,
-            metrics["auc"],
-            cfg.eval_k,
-            metrics["hitrate@k"],
-            cfg.eval_k,
-            metrics["precision@k"],
-            metrics["mrr"],
-        )
-
-    # 5) 保存
-    torch.save(
-        {
-            "gnn_state_dict": gnn_model.state_dict(),
-            "rec_state_dict": rec_model.state_dict(),
-            "config": cfg.__dict__,
-        },
-        cfg.out_ckpt,
-    )
-    logger.info(f"✅ 模型训练完成并已保存：{cfg.out_ckpt}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="多模态 GraphSAGE + BPR 训练（更鲁棒版）")
-    parser.add_argument("--interactions", default="01_elec_5core_interactions.csv")
-    parser.add_argument("--image_feat", default="04_image_feat_aligned.npy")
-    parser.add_argument("--text_feat", default="04_text_feat_aligned.npy")
-    parser.add_argument("--edges", default="05_joint_knn_edges.npz")
-    parser.add_argument("--out_ckpt", default="multimodal_recommender_final.pth")
-    parser.add_argument("--out_user_map", default="user_id_map.csv")
-    parser.add_argument("--batch_size", type=int, default=2048)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-3, help="用户 embedding 学习率（联合训练时）")
-    parser.add_argument(
-        "--lr_gnn",
-        type=float,
-        default=None,
-        help="GNN 学习率；默认不指定时使用 lr * lr_gnn_ratio",
-    )
-    parser.add_argument("--lr_gnn_ratio", type=float, default=0.1, help="未指定 lr_gnn 时，GNN lr = lr * ratio")
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--output_dim", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.2, help="GraphSAGE 第一层后的 dropout 概率")
-    parser.add_argument(
-        "--freeze_gnn_epochs",
-        type=int,
-        default=5,
-        help="前多少个 epoch 只训练 user embedding（GNN 冻结前向）",
-    )
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log_every", type=int, default=50)
-    parser.add_argument("--log_file", default="train.log")
-    parser.add_argument("--eval_users", type=int, default=5000)
-    parser.add_argument("--eval_neg", type=int, default=100)
-    parser.add_argument("--eval_k", type=int, default=10)
-    args = parser.parse_args()
-
-    cfg = TrainConfig(
-        interactions=args.interactions,
-        image_feat=args.image_feat,
-        text_feat=args.text_feat,
-        edges=args.edges,
-        out_ckpt=args.out_ckpt,
-        out_user_map=args.out_user_map,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        lr_gnn=args.lr_gnn,
-        lr_gnn_ratio=args.lr_gnn_ratio,
-        hidden_dim=args.hidden_dim,
-        output_dim=args.output_dim,
-        dropout=args.dropout,
-        freeze_gnn_epochs=args.freeze_gnn_epochs,
-        weight_decay=args.weight_decay,
-        seed=args.seed,
-        log_every=args.log_every,
-        log_file=args.log_file,
-        eval_users=args.eval_users,
-        eval_neg=args.eval_neg,
-        eval_k=args.eval_k,
-    )
-    train(cfg)
+    # 可选：生成最终的全量物品嵌入（用于评估）
+    print("生成全量物品嵌入...")
+    gnn_model.eval()
+    with torch.no_grad():
+        full_item_emb = gnn_model(node_features, edge_index).cpu().numpy()
+    np.save('item_embeddings_final_mhm.npy', full_item_emb)
+    print("物品嵌入已保存至 item_embeddings_final_mhm.npy")
 
 
 if __name__ == "__main__":
-    main()
+    train()

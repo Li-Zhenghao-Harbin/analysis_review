@@ -4,11 +4,11 @@ from tqdm import tqdm
 import os
 
 # ========== 配置 ==========
-IMAGE_ALIGNED_FILE = '04_image_feat_aligned.npy'   # 对齐后的图像特征 (N, 256)
-TEXT_ALIGNED_FILE  = '04_text_feat_aligned.npy'    # 对齐后的文本特征 (N, 256)
-OUTPUT_NEIGHBORS = '05_joint_knn_neighbors.npy'
-OUTPUT_SCORES    = '05_joint_knn_scores.npy'
-OUTPUT_EDGES     = '05_joint_knn_edges.npz'
+IMAGE_ALIGNED_FILE = '04_image_feat_aligned_02.npy'   # 对齐后的图像特征 (N, 256)
+TEXT_ALIGNED_FILE  = '04_text_feat_aligned_02.npy'    # 对齐后的文本特征 (N, 256)
+OUTPUT_NEIGHBORS = '05_joint_knn_neighbors_02.npy'
+OUTPUT_SCORES    = '05_joint_knn_scores_02.npy'
+OUTPUT_EDGES     = '05_joint_knn_edges_02.npz'
 K = 20                      # 每个节点的邻居数（不含自身）
 
 # ========== 1. 加载对齐特征 ==========
