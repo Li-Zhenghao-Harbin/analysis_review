@@ -12,3 +12,5 @@
 *.npz
 *.pyc
 .vscode
+
+run_with_free_gpu.sh

@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -402,6 +403,26 @@ def choose_sample_item_ids(interactions: pd.DataFrame, n: int, max_id: int) -> L
     return sorted(rng.choice(item_ids, size=n, replace=False).tolist())
 
 
+def setup_loggers(log_path: Optional[str]) -> logging.Logger:
+    """写入 log 文件（若给定路径）；同时镜像到控制台。"""
+    logger = logging.getLogger("coldstart_pipeline_debug")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+    fmt = logging.Formatter("%(message)s")
+    if log_path:
+        d = os.path.dirname(os.path.abspath(log_path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
 def main():
     parser = argparse.ArgumentParser(description="诊断你的冷启动推荐 pipeline：数据对齐、特征质量、KNN 图、07 的评估退化。")
     parser.add_argument("--interactions", default="01_elec_5core_interactions.csv")
@@ -417,7 +438,14 @@ def main():
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--sample_items", type=int, default=5)
     parser.add_argument("--neighbor_topk", type=int, default=5)
+    parser.add_argument(
+        "--log-file",
+        default="debug_coldstart_pipeline.log",
+        help="诊断输出写入的日志文件路径（UTF-8）；设为空字符串则仅打印到控制台。",
+    )
     args = parser.parse_args()
+
+    log = setup_loggers(args.log_file or None)
 
     cfg = Config(
         interactions=args.interactions,
@@ -435,22 +463,22 @@ def main():
         neighbor_topk=args.neighbor_topk,
     )
 
-    print("=" * 80)
-    print("Cold-start Pipeline Diagnostic")
-    print("=" * 80)
+    log.info("=" * 80)
+    log.info("Cold-start Pipeline Diagnostic")
+    log.info("=" * 80)
 
     if not os.path.exists(cfg.interactions):
         raise FileNotFoundError(f"找不到 interactions 文件: {cfg.interactions}")
 
     interactions, lines, interaction_metrics = describe_interactions(cfg.interactions)
-    print("\n[SECTION] Interactions")
+    log.info("\n[SECTION] Interactions")
     for line in lines:
-        print(line)
+        log.info(line)
 
     meta = load_jsonl_meta(cfg.meta) if cfg.meta else {}
     if cfg.meta:
-        print("\n[SECTION] Meta")
-        print(stat_line("meta_items", len(meta)))
+        log.info("\n[SECTION] Meta")
+        log.info(stat_line("meta_items", len(meta)))
 
     matrices: Dict[str, np.ndarray] = {}
     feature_metrics: Dict[str, Dict[str, float]] = {}
@@ -463,18 +491,18 @@ def main():
         if path:
             arr = np.load(path)
             matrices[name] = arr
-            print(f"\n[SECTION] Feature Matrix: {name}")
+            log.info(f"\n[SECTION] Feature Matrix: {name}")
             desc_lines, metrics = describe_feature_matrix(name, arr)
             feature_metrics[name] = metrics
             for line in desc_lines:
-                print(line)
+                log.info(line)
         else:
-            print(f"\n[SECTION] Feature Matrix: {name}")
-            print(warn_line("文件不存在，跳过。"))
+            log.info(f"\n[SECTION] Feature Matrix: {name}")
+            log.info(warn_line("文件不存在，跳过。"))
 
-    print("\n[SECTION] Alignment Sanity")
+    log.info("\n[SECTION] Alignment Sanity")
     for line in compare_feature_shapes(interactions, matrices):
-        print(line)
+        log.info(line)
 
     all_num_items = [arr.shape[0] for arr in matrices.values() if arr.ndim == 2]
     if all_num_items:
@@ -482,55 +510,55 @@ def main():
     else:
         num_items = int(interaction_metrics.get("item_id_max", -1)) + 1
 
-    print("\n[SECTION] Rule-based Summary")
+    log.info("\n[SECTION] Rule-based Summary")
     for line in basic_rule_based_summary(feature_metrics):
-        print(line)
+        log.info(line)
 
-    print("\n[SECTION] KNN Graph")
+    log.info("\n[SECTION] KNN Graph")
     neighbors, scores, edges = load_knn(cfg.knn_neighbors, cfg.knn_scores, cfg.knn_edges)
     for line in diagnose_knn(num_items=num_items, neighbors=neighbors, scores=scores, edges=edges):
-        print(line)
+        log.info(line)
 
-    print("\n[SECTION] Val Split Fallback Check (mirrors current 07 logic)")
+    log.info("\n[SECTION] Val Split Fallback Check (mirrors current 07 logic)")
     for line in diagnose_val_fallback(interactions, num_items=num_items, val_ratio=cfg.val_ratio, random_seed=cfg.random_seed):
-        print(line)
+        log.info(line)
 
     sample_ids = choose_sample_item_ids(interactions, cfg.sample_items, max_id=num_items)
-    print("\n[SECTION] Sampled item_ids for neighbor preview")
-    print(stat_line("sample_item_ids", sample_ids))
+    log.info("\n[SECTION] Sampled item_ids for neighbor preview")
+    log.info(stat_line("sample_item_ids", sample_ids))
 
     if "raw_text_feat" in matrices:
-        print("\n[SECTION] Raw Text Neighbors")
+        log.info("\n[SECTION] Raw Text Neighbors")
         for line in print_neighbor_preview("raw_text_feat", matrices["raw_text_feat"], meta, sample_ids, cfg.neighbor_topk):
-            print(line)
+            log.info(line)
 
     if "aligned_text_feat" in matrices:
-        print("\n[SECTION] Aligned Text Neighbors")
+        log.info("\n[SECTION] Aligned Text Neighbors")
         for line in print_neighbor_preview("aligned_text_feat", matrices["aligned_text_feat"], meta, sample_ids, cfg.neighbor_topk):
-            print(line)
+            log.info(line)
 
     if "raw_image_feat" in matrices:
-        print("\n[SECTION] Raw Image Neighbors")
+        log.info("\n[SECTION] Raw Image Neighbors")
         for line in print_neighbor_preview("raw_image_feat", matrices["raw_image_feat"], meta, sample_ids, cfg.neighbor_topk):
-            print(line)
+            log.info(line)
 
     if "aligned_image_feat" in matrices:
-        print("\n[SECTION] Aligned Image Neighbors")
+        log.info("\n[SECTION] Aligned Image Neighbors")
         for line in print_neighbor_preview("aligned_image_feat", matrices["aligned_image_feat"], meta, sample_ids, cfg.neighbor_topk):
-            print(line)
+            log.info(line)
 
-    print("\n[SECTION] Raw vs Aligned Neighbor Drift")
+    log.info("\n[SECTION] Raw vs Aligned Neighbor Drift")
     for line in compare_raw_vs_aligned(matrices.get("raw_text_feat"), matrices.get("aligned_text_feat"), sample_ids, cfg.neighbor_topk, "text"):
-        print(line)
+        log.info(line)
     for line in compare_raw_vs_aligned(matrices.get("raw_image_feat"), matrices.get("aligned_image_feat"), sample_ids, cfg.neighbor_topk, "image"):
-        print(line)
+        log.info(line)
 
-    print("\n[SECTION] Final Hints")
-    print("1) 如果 raw/aligned 特征大量全零、NaN 或 shape 对不上，先停在特征层排查。")
-    print("2) 如果 KNN score 很低、reciprocal ratio 很低、人工看近邻不合理，先改建图。")
-    print("3) 如果 07 的 global_mean fallback 用户占比很高，先别信当前验证指标。")
-    print("4) 如果上面都正常，但训练效果仍差，再去改 loss、split 和负采样。")
-    print("=" * 80)
+    log.info("\n[SECTION] Final Hints")
+    log.info("1) 如果 raw/aligned 特征大量全零、NaN 或 shape 对不上，先停在特征层排查。")
+    log.info("2) 如果 KNN score 很低、reciprocal ratio 很低、人工看近邻不合理，先改建图。")
+    log.info("3) 如果 07 的 global_mean fallback 用户占比很高，先别信当前验证指标。")
+    log.info("4) 如果上面都正常，但训练效果仍差，再去改 loss、split 和负采样。")
+    log.info("=" * 80)
 
 
 if __name__ == "__main__":
