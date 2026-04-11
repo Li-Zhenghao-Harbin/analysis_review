@@ -1,280 +1,304 @@
-# 项目脚本执行指南（完整流程）
+﻿# 多模态商品推荐项目完整流程（从零到可复现）
 
-这份指南讲清楚：这些 Python 脚本怎么跑、按什么顺序跑、每一步会产出什么文件，以及常见坑如何避免。
+本文件基于当前仓库中的实际脚本与默认参数整理，目标是：
 
----
-
-## 你将得到什么
-
-- **交互数据（5-core + 数字ID）**：`elec_5core_interactions.csv`
-- **商品元数据（精简后 + 数字item_id）**：`elec_5core_meta.jsonl`
-- **训练/验证/测试划分**：`data/Electronics/train.json`、`val.json`、`test.json`
-- **文本特征向量**（每个商品 1 条）：`text_feat.npy`（通常是 `n_items × 384`）
-- **图片特征向量**（每个商品 1 张图）：`image_feat.npy`（`n_items × 2048`）
-
-> 说明：当前代码里“文本向量”来自商品 `title + categories`，不是逐条 review（评论）文本向量。
+- 用商品文本 + 商品图片做多模态表示；
+- 通过跨模态对齐和 KNN 建图构造商品图；
+- 训练 GraphSAGE + BPR 推荐模型；
+- 做诊断与（条件满足时）推理。
 
 ---
 
-## 环境准备（Windows + PowerShell）
+## 1. 项目结构与职责（按阶段）
 
-建议使用 Python 3.10/3.11（3.8 也大概率可用）。
+- `01_rawdata_filter_5_core.py`：从原始 Amazon 风格数据做 5-core 过滤 + ID 映射，产出交互和精简 meta。
+- `00_data_split.py`：按用户内部交互切分 train/val/test（json 字典格式）。
+- `02_extract_text.py`：从 `title + categories` 提取文本向量（SentenceTransformer）。
+- `03_new_extract_image.py`：从商品图 URL 抽取 ResNet50 图像向量。
+- `04_alignment_02.py`：跨模态对齐（InfoNCE 双塔投影），导出对齐后的 text/image 向量。
+- `05_build_joint_knn_from_aligned.py`：拼接对齐向量并用 FAISS 建联合 KNN 图。
+- `07_train_bpr_mhm_02.py`：在商品图上训练 GraphSAGE + BPR。
+- `debug_coldstart_pipeline.py`：全链路诊断（特征质量、图质量、评估退化等），可写日志。
+- `08_infer_recommender.py`：推理脚本（注意与训练 ckpt 格式兼容性，见文末）。
+- `06_gnn_model.py`：GraphSAGE 模型定义与导出工具（辅助脚本）。
 
-### 1) 创建虚拟环境（推荐）
+---
+
+## 2. 环境准备
+
+推荐你当前使用的 Conda 方式（`start.md`）：
 
 ```bash
-python -m venv .venv
-.\.venv\Scripts\activate
+conda create -n analysis_review python=3.11 -y
+conda activate analysis_review
+conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
+pip install -r requirements.txt
 ```
 
-### 2) 安装依赖
+补充说明：
 
-你这些脚本用到的主要库：
-
-- `numpy`
-- `pandas`
-- `ujson`
-- `tqdm`
-- `requests`
-- `Pillow`
-- `torch`、`torchvision`
-- `sentence-transformers`
-
-安装命令（一次性装齐）：
-
-```bash
-pip install -U pip
-pip install numpy pandas ujson tqdm requests Pillow sentence-transformers
-pip install torch torchvision
-```
-
-> 如果你有 NVIDIA 显卡并想用 CUDA，请安装与你 CUDA 版本匹配的 PyTorch（以 PyTorch 官网为准）。不装 CUDA 也能跑，只是会慢很多。
+- 若无 GPU，把第三行改成 CPU 版本安装 PyTorch。
+- `torch-geometric` 在部分环境可能需要按官方说明单独安装对应 wheel。
 
 ---
 
-## 数据文件准备（你需要放到哪里、叫什么）
+## 3. 关键输入与命名约定
 
-这些脚本默认用**相对路径**读取文件，通常意味着：你要在**项目根目录**（也就是这些 `.py` 文件所在目录）直接运行它们。
+当前脚本默认大量使用固定文件名。仓库中已存在以下主干产物：
 
-### 必需的原始数据（用于 5-core 预处理）
+- `01_elec_5core_interactions.csv`
+- `01_elec_5core_meta.jsonl`
+- `02_text_feat.npy`
+- `03_image_feat.npy`
+- `04_image_feat_aligned_02.npy`
+- `04_text_feat_aligned_02.npy`
+- `05_joint_knn_edges_02.npz`
 
-`01_rawdata_filter_5_core.py` 里写死的路径是：
+建议后续都沿用这套 `01/02/03/04/05 + _02` 命名，避免脚本互相找不到文件。
+
+---
+
+## 4. 从原始数据开始的完整执行顺序
+
+> 若你已经有第 01~05 阶段产物，可从第 8 节直接训练或从第 9 节诊断。
+
+### 步骤 A：5-core 预处理（交互 + 元数据）
+
+执行：
+
+```bash
+python 01_rawdata_filter_5_core.py
+```
+
+默认输入（脚本中写死）：
 
 - `Digital_Music.jsonl/Electronics.jsonl`
 - `Digital_Music.jsonl/meta_Electronics.jsonl`
 
-所以你需要把文件放成这样：
-
-```text
-my_project/
-  Digital_Music.jsonl/
-    Electronics.jsonl
-    meta_Electronics.jsonl
-  01_rawdata_filter_5_core.py
-  ...
-```
-
-> 如果你的原始数据不在这个位置/不是这个名字，请直接改 `01_rawdata_filter_5_core.py` 最下面那行 `fast_preprocess(...)` 的两个输入路径。
-
----
-
-## 完整执行流程（推荐顺序）
-
-下面按“从原始数据 → 可训练数据 → 特征向量”的顺序来跑。
-
-### 步骤 A（可选）：先看看元数据缺失情况（EDA）
-
-脚本：`00_EDA.py`
-
-用途：统计 `.jsonl` 每列的非空率。
-
-⚠️ 注意：这个脚本里写死了一个你电脑上可能不存在的路径（`D:\...`），你需要把最后一行改成你自己的 `.jsonl` 路径再运行。
-
-运行：
-
-```bash
-python .\00_EDA.py
-```
-
----
-
-### 步骤 B：5-core 过滤 + 生成干净交互/元数据（核心步骤）
-
-脚本：`01_rawdata_filter_5_core.py`
-
-它会做三件事：
-
-- 扫描交互数据，找出满足 5-core 的用户/商品
-- 把原始 `user_id`/`parent_asin` 映射成数字 ID（从 0 开始）
-- 输出精简元数据（只保留 `title/images/categories` 等字段）
-
-运行：
-
-```bash
-python .\01_rawdata_filter_5_core.py
-```
-
-产出（默认写到项目根目录）：
+默认输出（脚本参数 `output_prefix='elec_5core'`）：
 
 - `elec_5core_interactions.csv`
 - `elec_5core_meta.jsonl`
 
----
+建议：若后续要无缝跑当前主链脚本，请把输出重命名为：
 
-### 步骤 C：按用户切分 train/val/test
+- `01_elec_5core_interactions.csv`
+- `01_elec_5core_meta.jsonl`
 
-脚本：`00_data_split.py`
+### 步骤 B：切分 train/val/test（可选）
 
-它会读取：
-
-- `elec_5core_interactions.csv`
-
-并写出到：
-
-- `data/Electronics/train.json`
-- `data/Electronics/val.json`
-- `data/Electronics/test.json`
-
-运行：
+执行：
 
 ```bash
-python .\00_data_split.py
+python 00_data_split.py
 ```
 
----
+默认读取：`elec_5core_interactions.csv`
+输出：`data/Electronics/train.json`、`val.json`、`test.json`
 
-### 步骤 D：提取“商品文本向量”（title + categories）
+说明：该切分目前主要用于数据分析/备用流程；主训练脚本 `07_train_bpr_mhm_02.py` 会自行再按用户切分。
 
-脚本：`02_extract_text.py`
+### 步骤 C：文本特征提取
 
-它会读取：
+执行：
 
-- `elec_5core_meta.jsonl`
+```bash
+python 02_extract_text.py
+```
+
+默认读取：`01_elec_5core_meta.jsonl`
+输出：`text_feat.npy`
+
+建议统一命名：
+
+```bash
+# PowerShell
+Copy-Item text_feat.npy 02_text_feat.npy
+```
+
+> 代码里有一个小问题：`print(f"检测到设备: {device.upper(x)}")` 应该改成 `device.upper()`。
+
+### 步骤 D：图像特征提取
+
+执行：
+
+```bash
+python 03_new_extract_image.py
+```
+
+默认读取：`01_elec_5core_meta.jsonl`
+输出：`image_feat.npy`
+
+建议统一命名：
+
+```bash
+Copy-Item image_feat.npy 03_image_feat.npy
+```
+
+备注：脚本遇到无图或下载失败时会填零向量（这会影响建图质量，后续可用诊断脚本检查比例）。
+
+### 步骤 E：跨模态对齐（InfoNCE）
+
+执行：
+
+```bash
+python 04_alignment_02.py
+```
+
+默认读取：
+
+- `03_image_feat.npy`
+- `02_text_feat.npy`
+- `01_elec_5core_interactions.csv`
 
 输出：
 
-- `text_feat.npy`
+- `04_cross_modal_alignment_02.pt`
+- `04_image_feat_aligned_02.npy`
+- `04_text_feat_aligned_02.npy`
 
-运行：
+核心机制：
 
-```bash
-python .\02_extract_text.py
-```
+- 在训练阶段仅用训练划分里的 item 学 projection head；
+- 推理阶段对全量 item 导出对齐向量；
+- 损失函数为双向 InfoNCE。
 
-提示：
+### 步骤 F：构建联合 KNN 图
 
-- 机器没 GPU 也能跑，但会慢。
-- 文本向量与 `item_id` 一一对应：`text_feat[i]` 就是 `item_id=i` 的商品向量。
-
----
-
-### 步骤 E（推荐）：检查文本向量 shape 是否正确
-
-脚本：`00_check_shape.py`
-
-读取：
-
-- `text_feat.npy`
-
-运行：
+执行：
 
 ```bash
-python .\00_check_shape.py
+python 05_build_joint_knn_from_aligned.py
 ```
 
-你会看到类似：
+默认读取：
 
-- `n_items`（商品数）
-- `dim`（向量维度，`all-MiniLM-L6-v2` 通常是 384）
-
----
-
-### 步骤 F（可选）：随机下载 100 张商品图做肉眼检查
-
-脚本：`00_download_image100.py`
-
-⚠️ 注意：这个脚本默认读取 `01_elec_5core_meta.jsonl`，但你在步骤 B 产出的是 `elec_5core_meta.jsonl`。
-
-你有两种方式修：
-
-- **方式 1（推荐）**：把脚本最后一行改成：
-  - `download_100_samples('elec_5core_meta.jsonl')`
-- **方式 2**：把 `elec_5core_meta.jsonl` 复制/改名成 `01_elec_5core_meta.jsonl`
-
-运行：
-
-```bash
-python .\00_download_image100.py
-```
-
-输出目录：
-
-- `test_images/`
-
----
-
-### 步骤 G（可选）：先小规模测速图片特征提取耗时
-
-脚本：`03_test_extract_image.py`
-
-运行（默认测试前 5000 个商品）：
-
-```bash
-python .\03_test_extract_image.py
-```
-
-它会输出：
-
-- 平均每个样本耗时
-- 全量大概需要多久
-
-> 这个脚本主要用于估时/验证，不会产出最终的 `image_feat.npy`。
-
----
-
-### 步骤 H：全量提取“商品图片向量”（ResNet50, 2048维）
-
-脚本：`03_extract_image.py`
-
-读取：
-
-- `elec_5core_meta.jsonl`
+- `04_image_feat_aligned_02.npy`
+- `04_text_feat_aligned_02.npy`
 
 输出：
 
-- `image_feat.npy`
+- `05_joint_knn_neighbors_02.npy`
+- `05_joint_knn_scores_02.npy`
+- `05_joint_knn_edges_02.npz`
 
-运行：
+说明：
+
+- 使用 FAISS 内积索引 + L2 归一化（等价余弦）；
+- 检索 `K+1` 后去掉自身，理论上不应有 self-loop（若仍出现，建议用诊断脚本复查）。
+
+---
+
+## 5. 训练主模型（GraphSAGE + BPR）
+
+执行：
 
 ```bash
-python .\03_extract_image.py
+python 07_train_bpr_mhm_02.py
 ```
 
-重要提示（很关键）：
+默认读取：
 
-- **耗时很长**：需要下载大量图片，受网速/对方服务器限制影响很大。
-- **需要较大内存**：脚本会一次性初始化 `n_items × 2048` 的矩阵，商品数很大时会吃内存。
-- **失败回退**：没图或下载失败会用全 0 向量填充该 `item_id` 的行。
-- **每个商品只用 1 张图**：取 `images[0]`（第一张）。
+- `04_image_feat_aligned_02.npy`
+- `04_text_feat_aligned_02.npy`
+- `05_joint_knn_edges_02.npz`
+- `01_elec_5core_interactions.csv`
+
+输出目录：`outputs_isolated/`
+
+主要产物：
+
+- `best_model.pth`（仅 `model.state_dict()`）
+- `checkpoint_epoch_*.pt`（包含优化器、曲线、best_auc 等）
+- `user_emb_cache.pt`（验证用户向量缓存）
+
+训练逻辑要点：
+
+- 先按用户切分 train/val；
+- 只保留 train-item 子图训练；
+- 用边采样构造 `(u, pos, neg)`，优化 BPR 损失；
+- 每个 epoch 做 AUC + Recall@K 评估。
 
 ---
 
-## 如何用这些向量做“相似商品检索”（你后续要做的事）
+## 6. 诊断与质量检查（强烈建议每轮都跑）
 
-当前脚本只负责把特征提出来；“融合 + 相似检索”通常在另一个脚本里做。
+执行：
 
-最常见做法：
+```bash
+python debug_coldstart_pipeline.py --log-file debug_coldstart_pipeline.log
+```
 
-1. 读入 `text_feat.npy` 和 `image_feat.npy`（两者都以 `item_id` 作为行索引）
-2. 各自做 L2 归一化
-3. 加权拼接成融合向量
-4. 用余弦相似度做 Top-K 最近邻搜索
+会检查：
+
+- 交互基本统计、重复行、ID 范围；
+- 特征矩阵 NaN/Inf/零行；
+- 行数对齐；
+- KNN 非法边、自环、分数分布、双向边比例；
+- 当前 07 评估协议下的 `global_mean fallback` 比例；
+- 样本商品近邻可解释性。
+
+如果你看到：
+
+- `global_mean_fallback_users` 非常高（尤其接近 100%），说明当前验证协议会严重弱化评估可信度；
+- `aligned_text_feat` 缺失，说明流程没有完整跑通（仅图像对齐不够）。
 
 ---
 
-## 常见问题排查
+## 7. 推理（当前状态下的兼容性说明）
 
-- **找不到文件**：大概率是你不是在项目根目录运行，或文件名/路径和脚本写的不一致。
-- **图片下载很慢/失败多**：网络、超时、对方限流都可能导致；可以先跑 `03_test_extract_image.py` 估时。
-- **CPU 太慢**：文本和图片特征都能用 GPU 加速（尤其是图片 ResNet50）。
+脚本：`08_infer_recommender.py`
 
+它要求 `--ckpt` 内含：
+
+- `gnn_state_dict`
+- `rec_state_dict`（含 `user_embedding.weight`）
+
+但当前 `07_train_bpr_mhm_02.py` 保存的 `best_model.pth` 只有单一 `model.state_dict()`，**二者格式不兼容**，因此直接推理会失败。
+
+可选方案：
+
+1. **改训练保存格式**：在训练脚本里按 `08` 所需键名保存完整字典；
+2. **改推理脚本**：适配 `07` 的 checkpoint（仅 item encoder），并重新定义用户向量来源；
+3. **仅做 item-item 检索**：直接基于 `debug` 或 `05` 产物做相似商品推荐。
+
+---
+
+## 8. 一条可直接复现的命令链（当前项目命名）
+
+```bash
+python 02_extract_text.py
+Copy-Item text_feat.npy 02_text_feat.npy
+
+python 03_new_extract_image.py
+Copy-Item image_feat.npy 03_image_feat.npy
+
+python 04_alignment_02.py
+python 05_build_joint_knn_from_aligned.py
+python 07_train_bpr_mhm_02.py
+
+python debug_coldstart_pipeline.py --log-file debug_coldstart_pipeline.log
+```
+
+---
+
+## 9. 常见问题与改进建议
+
+- **评估退化**：按用户切分导致验证用户在训练集中无历史，07 会大量退化到 `global_mean`；建议改成时间切分或 per-user 留一。
+- **命名不一致**：`text_feat.npy/image_feat.npy` 与 `02_/03_` 前缀混用，建议统一命名或在脚本顶部常量统一维护。
+- **图像零向量**：缺图商品建议后续加入“文本兜底”或“均值向量兜底”，减少 KNN 噪声。
+- **推理链路断点**：先统一 07 与 08 的 checkpoint 结构，再做线上化。
+
+---
+
+## 10. 文件对应速查表
+
+- 原始交互/元数据：`Digital_Music.jsonl/*.jsonl`
+- 5-core：`01_elec_5core_interactions.csv`、`01_elec_5core_meta.jsonl`
+- 原始特征：`02_text_feat.npy`、`03_image_feat.npy`
+- 对齐特征：`04_text_feat_aligned_02.npy`、`04_image_feat_aligned_02.npy`
+- 图结构：`05_joint_knn_edges_02.npz`（及 neighbors/scores）
+- 训练输出：`outputs_isolated/best_model.pth`、`checkpoint_epoch_*.pt`
+- 诊断日志：`debug_coldstart_pipeline.log`
+
+如果你希望，我可以在下一步直接把 `07_train_bpr_mhm_02.py` 与 `08_infer_recommender.py` 的 checkpoint 格式做成完全打通（训练后可直接 `recommend/similar`）。
