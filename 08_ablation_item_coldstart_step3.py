@@ -17,42 +17,28 @@ from tqdm import tqdm
 from collections import defaultdict
 
 # ============================================================
-# 统一对照实验脚本
+# 统一对照实验脚本（step3 同步版）
 # 支持：
-# 1) aligned + GNN
-# 2) raw + GNN
+# 1) aligned + GNN(residual)
+# 2) raw + GNN(residual)
 # 3) aligned + noGNN
 # 4) raw + noGNN
-#
-# 所有实验共用：
-# - 同一份 item-cold-start split (04_item_cold_split.npz)
-# - 同一套 train/val/test 用户过滤逻辑
-# - 同一套评估逻辑
-#
-# 输出：
-# - 每个实验一个 train_log.txt
-# - 每个实验一个 history.csv
-# - 全部实验一个 ablation_summary.csv
 # ============================================================
 
 
 @dataclass
 class Config:
-    # ---------- 特征文件 ----------
     raw_img_feat_path: str = "03_image_feat.npy"
     raw_txt_feat_path: str = "02_text_feat.npy"
     aligned_img_feat_path: str = "04_image_feat_aligned_item_coldstart.npy"
     aligned_txt_feat_path: str = "04_text_feat_aligned_item_coldstart.npy"
 
-    # ---------- 公共输入 ----------
-    edge_path: str = "05_joint_knn_edges_02.npz"
+    edge_path: str = "05_joint_knn_edges_item_coldstart.npz"
     interaction_path: str = "01_elec_5core_interactions.csv"
     split_path: str = "04_item_cold_split.npz"
 
-    # ---------- 随机性 ----------
     random_seed: int = 42
 
-    # ---------- 训练 ----------
     epochs: int = 5
     batch_size: int = 128
     steps_per_epoch: int = 300
@@ -61,35 +47,28 @@ class Config:
     use_amp: bool = True
     max_history: int = 20
 
-    # ---------- GNN ----------
-    gnn_hidden_dim: int = 128
-    gnn_out_dim: int = 64
+    gnn_hidden_dim: int = 512
     gnn_dropout: float = 0.1
     fanouts: Tuple[int, int] = (15, 10)
+    residual_alpha: float = 0.7
+    hard_negative_ratio: float = 0.30
 
-    # ---------- noGNN ----------
     mlp_hidden_dim: int = 256
     mlp_out_dim: int = 64
     mlp_dropout: float = 0.1
 
-    # ---------- 评估 ----------
     eval_top_k: Tuple[int, ...] = (10, 20, 50)
     eval_negatives: int = 99
     eval_max_users: int = 500
 
-    # ---------- 运行哪些实验 ----------
-    # 可选: aligned_gnn, raw_gnn, aligned_nognn, raw_nognn
     experiments: Tuple[str, ...] = (
-        "aligned_gnn",
-        "raw_gnn",
+#        "aligned_gnn",
+#        "raw_gnn",
         "aligned_nognn",
         "raw_nognn",
     )
 
-    # ---------- 输出 ----------
-    save_root: str = "outputs_ablation_item_coldstart"
-
-    # ---------- 设备 ----------
+    save_root: str = "outputs_ablation_item_coldstart_step3"
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -110,9 +89,6 @@ set_seed(cfg.random_seed)
 _rng = np.random.default_rng(cfg.random_seed)
 
 
-# ============================================================
-# 日志
-# ============================================================
 class TxtLogger:
     def __init__(self, log_path: str):
         self.log_path = log_path
@@ -128,18 +104,16 @@ class TxtLogger:
         self.fp.close()
 
 
-# ============================================================
-# 通用工具
-# ============================================================
 def clip_history(hist: List[int], max_len: int) -> List[int]:
     if len(hist) <= max_len:
         return hist
-    pick = _rng.choice(len(hist), size=max_len, replace=False)
-    return [hist[i] for i in pick.tolist()]
+    return hist[-max_len:]
 
 
 def build_user_histories(df: pd.DataFrame, item_mask: np.ndarray) -> Dict[int, List[int]]:
-    sub = df[df["item_id"].isin(np.where(item_mask)[0])]
+    sub = df[df["item_id"].isin(np.where(item_mask)[0])].copy()
+    if "timestamp" in sub.columns:
+        sub = sub.sort_values(["user_id", "timestamp"])
     return sub.groupby("user_id")["item_id"].apply(list).to_dict()
 
 
@@ -216,41 +190,12 @@ def prepare_data(num_items: int, logger: TxtLogger):
     }
 
 
-def sample_train_batch(train_users: List[int], train_user_items: Dict[int, List[int]], train_item_ids: np.ndarray):
-    users = random.choices(train_users, k=cfg.batch_size)
-    pos_items: List[int] = []
-    neg_items: List[int] = []
-    histories: List[List[int]] = []
-
-    for u in users:
-        items = train_user_items[u]
-        pos = random.choice(items)
-        hist = [i for i in items if i != pos]
-        if not hist:
-            hist = items[:]
-        hist = clip_history(hist, cfg.max_history)
-
-        pos_set = set(items)
-        neg = int(_rng.choice(train_item_ids))
-        while neg in pos_set:
-            neg = int(_rng.choice(train_item_ids))
-
-        pos_items.append(pos)
-        neg_items.append(neg)
-        histories.append(hist)
-
-    return pos_items, neg_items, histories
-
-
 def bpr_loss(user_emb: torch.Tensor, pos_emb: torch.Tensor, neg_emb: torch.Tensor) -> torch.Tensor:
     pos_score = (user_emb * pos_emb).sum(dim=1)
     neg_score = (user_emb * neg_emb).sum(dim=1)
     return -F.logsigmoid(pos_score - neg_score).mean()
 
 
-# ============================================================
-# 图工具 / GNN
-# ============================================================
 def build_csr(num_nodes: int, row: np.ndarray, col: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     order = np.argsort(row, kind="mergesort")
     row = row[order]
@@ -349,7 +294,14 @@ class GraphSAGE(nn.Module):
         return F.normalize(h, p=2, dim=1)
 
 
-def make_training_subgraph(x_np: np.ndarray, indptr: np.ndarray, indices: np.ndarray, pos_items: List[int], neg_items: List[int], histories: List[List[int]]):
+def make_training_subgraph(
+    x_np: np.ndarray,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    pos_items: List[int],
+    neg_items: List[int],
+    histories: List[List[int]],
+):
     seed = []
     seed.extend(pos_items)
     seed.extend(neg_items)
@@ -367,6 +319,12 @@ def make_training_subgraph(x_np: np.ndarray, indptr: np.ndarray, indices: np.nda
     return x_sub, edge_sub, pos_local, neg_local, hist_local
 
 
+def residual_fuse(content_x: torch.Tensor, gnn_emb: torch.Tensor) -> torch.Tensor:
+    content_emb = F.normalize(content_x, p=2, dim=1)
+    item_emb = cfg.residual_alpha * content_emb + (1.0 - cfg.residual_alpha) * gnn_emb
+    return F.normalize(item_emb, p=2, dim=1)
+
+
 def aggregate_user_embedding(item_emb: torch.Tensor, hist_local: List[List[int]]) -> torch.Tensor:
     vecs = []
     for hist in hist_local:
@@ -376,8 +334,61 @@ def aggregate_user_embedding(item_emb: torch.Tensor, hist_local: List[List[int]]
     return F.normalize(user_emb, p=2, dim=1)
 
 
+def sample_train_batch_gnn(
+    train_users: List[int],
+    train_user_items: Dict[int, List[int]],
+    train_item_ids: np.ndarray,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+):
+    users = random.choices(train_users, k=cfg.batch_size)
+    pos_items: List[int] = []
+    neg_items: List[int] = []
+    histories: List[List[int]] = []
+
+    train_item_set = set(train_item_ids.tolist())
+
+    for u in users:
+        items = train_user_items[u]
+        pos = random.choice(items)
+        hist = [i for i in items if i != pos]
+        if not hist:
+            hist = items[:]
+        hist = clip_history(hist, cfg.max_history)
+
+        pos_set = set(items)
+        neg = None
+
+        if random.random() < cfg.hard_negative_ratio:
+            start, end = indptr[pos], indptr[pos + 1]
+            nbrs = indices[start:end]
+            hard_candidates = [int(n) for n in nbrs if int(n) in train_item_set and int(n) not in pos_set]
+            if hard_candidates:
+                neg = int(random.choice(hard_candidates))
+
+        if neg is None:
+            neg = int(_rng.choice(train_item_ids))
+            while neg in pos_set:
+                neg = int(_rng.choice(train_item_ids))
+
+        pos_items.append(pos)
+        neg_items.append(neg)
+        histories.append(hist)
+
+    return pos_items, neg_items, histories
+
+
 @torch.no_grad()
-def evaluate_gnn(model: nn.Module, x_np: np.ndarray, indptr: np.ndarray, indices: np.ndarray, support_user_items: Dict[int, List[int]], target_user_items: Dict[int, List[int]], valid_users: List[int], candidate_mask: np.ndarray):
+def evaluate_gnn(
+    model: nn.Module,
+    x_np: np.ndarray,
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    support_user_items: Dict[int, List[int]],
+    target_user_items: Dict[int, List[int]],
+    valid_users: List[int],
+    candidate_mask: np.ndarray,
+):
     if not valid_users:
         return float("nan"), {k: float("nan") for k in cfg.eval_top_k}
 
@@ -404,7 +415,9 @@ def evaluate_gnn(model: nn.Module, x_np: np.ndarray, indptr: np.ndarray, indices
 
         x_sub = torch.from_numpy(x_np[nodes]).to(cfg.device)
         edge_sub = torch.from_numpy(edge_index_np).long().to(cfg.device)
-        sub_emb = model(x_sub, edge_sub)
+
+        gnn_emb = model(x_sub, edge_sub)
+        sub_emb = residual_fuse(x_sub, gnn_emb)
 
         support_local = torch.tensor([local_id[i] for i in support], dtype=torch.long, device=cfg.device)
         cand_local = torch.tensor([local_id[i] for i in cand.tolist()], dtype=torch.long, device=cfg.device)
@@ -428,9 +441,6 @@ def evaluate_gnn(model: nn.Module, x_np: np.ndarray, indptr: np.ndarray, indices
     return float(auc), dict(recalls)
 
 
-# ============================================================
-# noGNN
-# ============================================================
 class MLPEncoder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -445,8 +455,41 @@ class MLPEncoder(nn.Module):
         return F.normalize(self.net(x), p=2, dim=1)
 
 
+def sample_train_batch_nognn(train_users: List[int], train_user_items: Dict[int, List[int]], train_item_ids: np.ndarray):
+    users = random.choices(train_users, k=cfg.batch_size)
+    pos_items: List[int] = []
+    neg_items: List[int] = []
+    histories: List[List[int]] = []
+
+    for u in users:
+        items = train_user_items[u]
+        pos = random.choice(items)
+        hist = [i for i in items if i != pos]
+        if not hist:
+            hist = items[:]
+        hist = clip_history(hist, cfg.max_history)
+
+        pos_set = set(items)
+        neg = int(_rng.choice(train_item_ids))
+        while neg in pos_set:
+            neg = int(_rng.choice(train_item_ids))
+
+        pos_items.append(pos)
+        neg_items.append(neg)
+        histories.append(hist)
+
+    return pos_items, neg_items, histories
+
+
 @torch.no_grad()
-def evaluate_nognn(model: nn.Module, x_np: np.ndarray, support_user_items: Dict[int, List[int]], target_user_items: Dict[int, List[int]], valid_users: List[int], candidate_mask: np.ndarray):
+def evaluate_nognn(
+    model: nn.Module,
+    x_np: np.ndarray,
+    support_user_items: Dict[int, List[int]],
+    target_user_items: Dict[int, List[int]],
+    valid_users: List[int],
+    candidate_mask: np.ndarray,
+):
     if not valid_users:
         return float("nan"), {k: float("nan") for k in cfg.eval_top_k}
 
@@ -491,9 +534,6 @@ def evaluate_nognn(model: nn.Module, x_np: np.ndarray, support_user_items: Dict[
     return float(auc), dict(recalls)
 
 
-# ============================================================
-# 特征装载
-# ============================================================
 def load_feature_matrix(kind: str, logger: TxtLogger) -> np.ndarray:
     if kind == "aligned":
         img_path = cfg.aligned_img_feat_path
@@ -518,9 +558,6 @@ def load_feature_matrix(kind: str, logger: TxtLogger) -> np.ndarray:
     return x_np
 
 
-# ============================================================
-# 单个实验
-# ============================================================
 def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data: dict) -> dict:
     exp_dir = os.path.join(cfg.save_root, exp_name)
     os.makedirs(exp_dir, exist_ok=True)
@@ -532,6 +569,8 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
 
     x_np = load_feature_matrix(feature_kind, logger)
     num_items = x_np.shape[0]
+    in_dim = x_np.shape[1]
+    gnn_out_dim = in_dim
 
     data = shared_data.get("prepared_data")
     if data is None:
@@ -551,9 +590,8 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
             indptr, indices = graph_cache
             logger.log("[INFO] Reusing cleaned graph CSR cache.")
 
-    in_dim = x_np.shape[1]
     if use_gnn:
-        model = GraphSAGE(in_dim, cfg.gnn_hidden_dim, cfg.gnn_out_dim, cfg.gnn_dropout).to(cfg.device)
+        model = GraphSAGE(in_dim, cfg.gnn_hidden_dim, gnn_out_dim, cfg.gnn_dropout).to(cfg.device)
     else:
         model = MLPEncoder(in_dim, cfg.mlp_hidden_dim, cfg.mlp_out_dim, cfg.mlp_dropout).to(cfg.device)
 
@@ -572,17 +610,19 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
 
         for _ in pbar:
             optimizer.zero_grad(set_to_none=True)
-            pos_items, neg_items, histories = sample_train_batch(
-                data["train_users"], data["train_user_items"], data["train_item_ids"]
-            )
 
             if use_gnn:
+                pos_items, neg_items, histories = sample_train_batch_gnn(
+                    data["train_users"], data["train_user_items"], data["train_item_ids"], indptr, indices
+                )
                 x_sub, edge_sub, pos_local, neg_local, hist_local = make_training_subgraph(
                     x_np, indptr, indices, pos_items, neg_items, histories
                 )
+
                 if scaler is not None:
                     with torch.amp.autocast("cuda"):
-                        sub_emb = model(x_sub, edge_sub)
+                        gnn_emb = model(x_sub, edge_sub)
+                        sub_emb = residual_fuse(x_sub, gnn_emb)
                         user_emb = aggregate_user_embedding(sub_emb, hist_local)
                         pos_emb = sub_emb[pos_local]
                         neg_emb = sub_emb[neg_local]
@@ -591,15 +631,21 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    sub_emb = model(x_sub, edge_sub)
+                    gnn_emb = model(x_sub, edge_sub)
+                    sub_emb = residual_fuse(x_sub, gnn_emb)
                     user_emb = aggregate_user_embedding(sub_emb, hist_local)
                     pos_emb = sub_emb[pos_local]
                     neg_emb = sub_emb[neg_local]
                     loss = bpr_loss(user_emb, pos_emb, neg_emb)
                     loss.backward()
                     optimizer.step()
+
                 pbar.set_postfix(loss=f"{loss.item():.4f}", nodes=x_sub.size(0), edges=edge_sub.size(1))
+
             else:
+                pos_items, neg_items, histories = sample_train_batch_nognn(
+                    data["train_users"], data["train_user_items"], data["train_item_ids"]
+                )
                 pos_feat = torch.from_numpy(x_np[np.array(pos_items, dtype=np.int64)]).to(cfg.device)
                 neg_feat = torch.from_numpy(x_np[np.array(neg_items, dtype=np.int64)]).to(cfg.device)
                 hist_feat_list = [torch.from_numpy(x_np[np.array(h, dtype=np.int64)]).to(cfg.device) for h in histories]
@@ -628,6 +674,7 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
                     loss = bpr_loss(user_emb, pos_emb, neg_emb)
                     loss.backward()
                     optimizer.step()
+
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
             epoch_loss += float(loss.item())
@@ -731,9 +778,6 @@ def run_experiment(exp_name: str, feature_kind: str, use_gnn: bool, shared_data:
     return result
 
 
-# ============================================================
-# 主流程
-# ============================================================
 def main():
     shared_data: Dict[str, object] = {}
     results = []
