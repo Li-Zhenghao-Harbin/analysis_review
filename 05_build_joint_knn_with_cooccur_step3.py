@@ -21,6 +21,7 @@ K_COOC = 20             # 共现图每个节点最多保留多少个邻居
 IMAGE_WEIGHT = 0.30
 TEXT_WEIGHT = 0.70
 CHUNK_SIZE = 10000
+GPU_ID = 0              # 使用哪块 GPU
 
 
 # ========== 1. 加载对齐特征 ==========
@@ -52,10 +53,22 @@ joint_feat = np.concatenate([IMAGE_WEIGHT * img_feat, TEXT_WEIGHT * txt_feat], a
 faiss.normalize_L2(joint_feat)
 print(f'联合特征维度: {joint_feat.shape[1]} | image_weight={IMAGE_WEIGHT}, text_weight={TEXT_WEIGHT}')
 
-print('构建 FAISS 内积索引...')
+print('构建 FAISS GPU 内积索引...')
 dim = joint_feat.shape[1]
-index = faiss.IndexFlatIP(dim)
+if not hasattr(faiss, 'StandardGpuResources'):
+    raise RuntimeError('当前 faiss 不支持 GPU，请安装 faiss-gpu。')
+
+gpu_num = faiss.get_num_gpus()
+if gpu_num <= 0:
+    raise RuntimeError('未检测到可用 GPU，无法以 GPU 模式运行。')
+if GPU_ID < 0 or GPU_ID >= gpu_num:
+    raise ValueError(f'GPU_ID={GPU_ID} 超出可用范围 [0, {gpu_num - 1}]')
+
+cpu_index = faiss.IndexFlatIP(dim)
+res = faiss.StandardGpuResources()
+index = faiss.index_cpu_to_gpu(res, GPU_ID, cpu_index)
 index.add(joint_feat)
+print(f'FAISS 已启用 GPU 检索 | gpu_id={GPU_ID} | 可用GPU数={gpu_num}')
 
 print(f'检索每个节点的 {K_CONTENT + 1} 个最近邻...')
 neighbors_list = []

@@ -62,8 +62,8 @@ class Config:
     eval_max_users: int = 500
 
     experiments: Tuple[str, ...] = (
-#        "aligned_gnn",
-#        "raw_gnn",
+       "aligned_gnn",
+       "raw_gnn",
         "aligned_nognn",
         "raw_nognn",
     )
