@@ -1,0 +1,9 @@
+// {
+//     "runOnSave.commands": [
+//         {
+//             "match": ".*\\.py$",
+//             "command": "ssh g02@144.214.210.13 'bash /home/g02/my_project/run_with_free_gpu.sh ${fileBasename}'",
+//             "runIn": "terminal"
+//         }
+//     ]
+// }
